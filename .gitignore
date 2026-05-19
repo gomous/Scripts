@@ -1,0 +1,5 @@
+# Ignore the mapStyles directory (large tile assets)
+mapStyles/
+
+# Ignore any static/tiles directories (tile caches)
+**/static/tiles/
