@@ -22,10 +22,11 @@ public class VehicleController : Script
     private static volatile bool s_pendingSpawn   = false;
     private static volatile bool s_pendingDestroy = false;
     private static volatile bool s_pendingTakeoff = false;
-    private static volatile bool s_pendingLand    = false;
     private static volatile bool s_pendingHover   = false;
     private static Vector3       s_targetPos      = Vector3.Zero;
     private static volatile bool s_newTarget      = false;
+    private static volatile bool s_pendingLand    = false;
+    private static Vector3       s_landTarget     = Vector3.Zero;
     private static float         s_targetSpeed    = 30f;
 
     private Vehicle _heli      = null;
@@ -71,11 +72,43 @@ public class VehicleController : Script
                         byte[] data = cmdSock.Receive(ref ep);
                         string cmd  = Encoding.UTF8.GetString(data).Trim();
 
-                        if      (cmd == "SPAWN")   s_pendingSpawn   = true;
-                        else if (cmd == "DESTROY")  s_pendingDestroy = true;
-                        else if (cmd == "TAKEOFF")  s_pendingTakeoff = true;
-                        else if (cmd == "LAND")     s_pendingLand    = true;
-                        else if (cmd == "HOVER")    s_pendingHover   = true;
+                        if (cmd == "SPAWN")
+                            s_pendingSpawn = true;
+                        else if (cmd == "DESTROY")
+                            s_pendingDestroy = true;
+                        else if (cmd == "TAKEOFF")
+                            s_pendingTakeoff = true;
+                        else if (cmd == "HOVER")
+                            s_pendingHover = true;
+                        else if (cmd.StartsWith("LAND,"))
+                        {
+                            // LAND,x,y,z  or  LAND,HERE  or  LAND,SPAWN
+                            string[] p = cmd.Split(',');
+                            lock (s_lock)
+                            {
+                                if (p.Length == 2 && p[1] == "HERE")
+                                {
+                                    s_landTarget = Vector3.Zero; // signal = use current pos
+                                    s_pendingLand = true;
+                                }
+                                else if (p.Length == 2 && p[1] == "SPAWN")
+                                {
+                                    s_landTarget = new Vector3(-1, -1, -1); // signal = use spawn
+                                    s_pendingLand = true;
+                                }
+                                else if (p.Length == 4)
+                                {
+                                    float x, y, z;
+                                    if (float.TryParse(p[1], out x) &&
+                                        float.TryParse(p[2], out y) &&
+                                        float.TryParse(p[3], out z))
+                                    {
+                                        s_landTarget = new Vector3(x, y, z);
+                                        s_pendingLand = true;
+                                    }
+                                }
+                            }
+                        }
                         else if (cmd.StartsWith("GOTO,"))
                         {
                             string[] p = cmd.Split(',');
@@ -131,8 +164,15 @@ public class VehicleController : Script
         if (_heli == null || !_heli.Exists()) return;
 
         if (s_pendingTakeoff) { s_pendingTakeoff = false; DoTakeoff(); }
-        if (s_pendingLand)    { s_pendingLand    = false; DoLand();    }
         if (s_pendingHover)   { s_pendingHover   = false; DoHover();   }
+
+        if (s_pendingLand)
+        {
+            s_pendingLand = false;
+            Vector3 lt;
+            lock (s_lock) { lt = s_landTarget; }
+            DoLand(lt);
+        }
 
         if (s_newTarget)
         {
@@ -151,43 +191,96 @@ public class VehicleController : Script
 
         _driver.Task.ClearAll();
 
-        // Exact hash from vAutoDrive source
         Function.Call(unchecked((Hash)(-2115941754365708377L)),
             _driver,
             _heli,
-            0,
             target.X,
             target.Y,
-            target.Z,
-            4,
+            (int)target.Z,
             speed,
-            -1f,
-            (float)_heli.Heading,
+            1,
+            (float)(uint)_heli.Model.GetHashCode(),
+            1,
+            5f,
             -1
         );
 
-        _driver.KeepTaskWhenMarkedAsNoLongerNeeded = true;
-        ShowMessage(string.Format("Flying to ({0:F0},{1:F0},{2:F0}) spd:{3:F0}",
-            target.X, target.Y, target.Z, speed));
+        Function.Call(Hash.SET_PED_KEEP_TASK, _driver.Handle, true);
+        ShowMessage(string.Format("Flying to ({0:F0},{1:F0},{2:F0})",
+            target.X, target.Y, target.Z));
     }
 
     private void DoTakeoff()
     {
-        Vector3 takeoffTarget = new Vector3(_spawnPos.X, _spawnPos.Y, _spawnPos.Z + 80f);
-        FlyTo(takeoffTarget, 30f);
-        ShowMessage("Taking off...");
+        if (_driver == null || !_driver.Exists()) return;
+
+        float cx = _heli.Position.X;
+        float cy = _heli.Position.Y;
+        float cz = _heli.Position.Z;
+
+        _spawnPos = new Vector3(cx, cy, cz);
+        FlyTo(new Vector3(cx, cy, cz + 60f), 20f);
+        ShowMessage(string.Format("Taking off to Z={0:F0}", cz + 60f));
     }
 
-    private void DoLand()
+   private void DoLand(Vector3 landTarget)
     {
-        FlyTo(_spawnPos, 20f);
-        ShowMessage("Landing...");
+        if (_driver == null || !_driver.Exists()) return;
+
+        Vector3 target;
+
+        if (landTarget == Vector3.Zero)
+        {
+            target = new Vector3(_heli.Position.X, _heli.Position.Y, _heli.Position.Z);
+            ShowMessage("Landing here...");
+        }
+        else if (landTarget.X == -1 && landTarget.Y == -1 && landTarget.Z == -1)
+        {
+            target = new Vector3(_spawnPos.X, _spawnPos.Y, _spawnPos.Z);
+            ShowMessage("Returning to spawn...");
+        }
+        else
+        {
+            target = new Vector3(landTarget.X, landTarget.Y, landTarget.Z);
+            ShowMessage(string.Format("Landing at ({0:F0},{1:F0})", target.X, target.Y));
+        }
+
+        // Step 1: fly to XY of target at low altitude
+        _driver.Task.ClearAll();
+        Function.Call(unchecked((Hash)(-2115941754365708377L)),
+            _driver, _heli,
+            target.X, target.Y,
+            (int)(target.Z + 5f),   // just 5m above ground
+            15f, 1,
+            (float)(uint)_heli.Model.GetHashCode(),
+            1, 3f, -1
+        );
+        Function.Call(Hash.SET_PED_KEEP_TASK, _driver.Handle, true);
+
+        // Step 2: after 4 seconds start forcing it down
+        var landThread = new System.Threading.Thread(() =>
+        {
+            System.Threading.Thread.Sleep(4000);
+            // Force descend by setting velocity downward every tick for 10 seconds
+            var endTime = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < endTime)
+            {
+                lock (s_lock)
+                {
+                    if (_heli != null && _heli.Exists())
+                        _heli.Velocity = new GTA.Math.Vector3(0f, 0f, -5f);
+                }
+                System.Threading.Thread.Sleep(100);
+            }
+        }) { IsBackground = true };
+        landThread.Start();
     }
 
     private void DoHover()
     {
-        FlyTo(_heli.Position, 0f);
-        ShowMessage("Hovering...");
+        if (_driver == null || !_driver.Exists()) return;
+        FlyTo(new Vector3(_heli.Position.X, _heli.Position.Y, _heli.Position.Z), 5f);
+        ShowMessage("Hovering in place");
     }
 
     private void SpawnHeli()
@@ -196,8 +289,7 @@ public class VehicleController : Script
         DestroyHeli();
 
         Ped     player = Game.Player.Character;
-        Vector3 spawn  = player.Position + new Vector3(0f, 0f, 5f);
-        _spawnPos = spawn;
+        Vector3 spawn  = player.Position + new Vector3(0f, 0f, 3f);
 
         Model m = new Model("frogger");
         m.Request(5000);
@@ -208,19 +300,29 @@ public class VehicleController : Script
 
         if (_heli == null || !_heli.Exists()) { ShowMessage("Spawn FAILED"); return; }
 
+        _spawnPos = _heli.Position;
+
         _heli.IsInvincible = true;
         Function.Call(Hash.SET_ENTITY_AS_MISSION_ENTITY, _heli.Handle, true, true);
         Function.Call(Hash.SET_VEHICLE_ENGINE_ON, _heli.Handle, true, true, false);
 
-        _driver = _heli.CreatePedOnSeat(VehicleSeat.Driver, new Model(PedHash.FreemodeMale01));
-
+        _driver = _heli.CreatePedOnSeat(VehicleSeat.Driver,
+            new Model(PedHash.FreemodeMale01));
         if (_driver == null || !_driver.Exists()) { ShowMessage("Driver FAILED"); return; }
 
-        _driver.IsInvincible                     = true;
-        _driver.BlockPermanentEvents              = true;
-        _driver.KeepTaskWhenMarkedAsNoLongerNeeded = true;
-        _driver.CanBeDraggedOutOfVehicle          = false;
+        _driver.IsInvincible             = true;
+        _driver.BlockPermanentEvents     = true;
+        _driver.CanBeDraggedOutOfVehicle = false;
+        Function.Call(Hash.SET_PED_KEEP_TASK, _driver.Handle, true);
         Function.Call(Hash.SET_ENTITY_AS_MISSION_ENTITY, _driver.Handle, true, true);
+
+        int seats = Function.Call<int>(
+            Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, _heli.Handle);
+        if (seats >= 1)
+        {
+            player.Task.WarpIntoVehicle(_heli, VehicleSeat.Passenger);
+            ShowMessage("Franklin in passenger seat!");
+        }
 
         CreateCam();
         ShowMessage("Frogger ready! Python: takeoff to fly");
@@ -230,10 +332,18 @@ public class VehicleController : Script
     {
         DestroyCam();
 
+        Ped player = Game.Player.Character;
+        if (player != null && _heli != null &&
+            _heli.Exists() && player.IsInVehicle(_heli))
+        {
+            player.Task.LeaveVehicle();
+            Script.Wait(200);
+        }
+
         if (_driver != null && _driver.Exists())
         {
             _driver.Task.ClearAllImmediately();
-            _driver.KeepTaskWhenMarkedAsNoLongerNeeded = false;
+            Function.Call(Hash.SET_PED_KEEP_TASK, _driver.Handle, false);
             Function.Call(Hash.SET_ENTITY_AS_MISSION_ENTITY, _driver.Handle, false, true);
             _driver.MarkAsNoLongerNeeded();
             _driver.Delete();
@@ -256,15 +366,21 @@ public class VehicleController : Script
         string msg = string.Format("{0},{1},{2},{3},{4},{5}",
             pos.X, pos.Y, pos.Z, vel.X, vel.Y, vel.Z);
         byte[] data = Encoding.UTF8.GetBytes(msg);
-        try { s_teleSock.Send(data, data.Length, new IPEndPoint(IPAddress.Loopback, TELE_PORT)); }
+        try
+        {
+            s_teleSock.Send(data, data.Length,
+                new IPEndPoint(IPAddress.Loopback, TELE_PORT));
+        }
         catch { }
     }
 
     private void CreateCam()
     {
         DestroyCam();
-        _camHandle = Function.Call<int>(Hash.CREATE_CAM, "DEFAULT_SCRIPTED_CAMERA", false);
-        Function.Call(Hash.ATTACH_CAM_TO_ENTITY, _camHandle, _heli.Handle, 0f, -12f, 4f, true);
+        _camHandle = Function.Call<int>(
+            Hash.CREATE_CAM, "DEFAULT_SCRIPTED_CAMERA", false);
+        Function.Call(Hash.ATTACH_CAM_TO_ENTITY,
+            _camHandle, _heli.Handle, 0f, -12f, 4f, true);
         Function.Call(Hash.SET_CAM_ROT,    _camHandle, -15f, 0f, 0f, 2);
         Function.Call(Hash.SET_CAM_ACTIVE, _camHandle, true);
         Function.Call(Hash.RENDER_SCRIPT_CAMS, true, false, 0, true, false);
